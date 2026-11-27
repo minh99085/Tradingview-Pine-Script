@@ -1,0 +1,422 @@
+// =============================================================================
+// FlowQ MC v2 — the ONE merged signal script, webhook-wired
+// =============================================================================
+// v2.5 (2026-09-24) — higher-timeframe accuracy fixes, measured on 79 symbols
+// (stocks, ETFs, crypto; 4h = last 2 years, D/W/M = full history). What
+// the backtest found, and what changed:
+//
+//   * THE DAILY CHART NEVER FIRED A LONG. With the default "D" filter on a
+//     1D chart the filter is the chart's OWN EMA9 > EMA21 — and that cannot
+//     be true while WaveTrend is below -53 (price just fell hard below its
+//     short EMAs). Result: 0 longs in 79 symbols x ~30 years. On 4h the
+//     daily filter blocked 97% of signals (27 left). On W/M the "D" filter
+//     is a LOWER timeframe than the chart, i.e. day-to-day noise.
+//     FIX: "Auto" trend-filter timeframe (new default) = TWO steps above
+//     the chart: 4h->W, D->M, W->3M, M->12M. Slow enough to be the trend a
+//     dip happens IN, not the dip itself. If the symbol is too young for
+//     that (fewer than tfSlow completed bars), it falls back ONE step
+//     (4h->D, D->W, W->M, M->3M) before giving up and going gray.
+//     Measured (long signals, next-open entry, +/-1.5 ATR within 10 bars,
+//     vs random entries on the same symbols; train | held-out symbols):
+//        4h:  27 signals            -> 487 signals, win-rate edge +3.6 | +5.1
+//        1D:   0 signals            -> 3921 signals, edge +2.2 | +1.3
+//        1W: edge +1.0 | -2.0       -> +1.0 | -2.3   (no edge either way)
+//        1M: 90 signals, too few to call; filter makes no measurable edge
+//     On 1D, dips bought in a MONTHLY uptrend beat those in a monthly
+//     downtrend in 3 of 4 decades (tied in 2000-2010).
+//   * INDEX / NO-VOLUME SYMBOLS (SPX, NDX, DXY...): the score multiplied
+//     by volume, so na volume made the score na and nothing ever fired.
+//     The score now falls back to path quality alone when a symbol has
+//     never printed volume.
+//   * NEW, OFF BY DEFAULT: "Show the signal track record" — the chart
+//     grades its OWN past triangles (same +/-ATR rule as above) and shows
+//     win-rate next to random entries on the same chart. Use it before
+//     trusting a triangle on a new symbol/timeframe.
+//
+//   HONEST LIMIT: no setting of this signal family is a big edge on W/M.
+//   A gradient-boosted model fed every feature here (WT, score, RSI, MAs,
+//   trend state, candle shape) reached out-of-sample AUC 0.51-0.53 on
+//   4h/D/W/M — the triangles are timing aids, not predictions.
+//
+//   TRADING-SYSTEM MIRROR: the Python mirror of the trend filter must use
+//   the same auto timeframe (D chart -> monthly EMA9 > EMA21, completed
+//   bars; weekly if < 21 months of history) or chart and bot disagree.
+//   The webhook JSON fields are unchanged. Re-create the alert after
+//   pasting.
+//
+// v2.4 (2026-08-31) — the gate table is OFF by default (Settings ->
+// "Show the long-gates table" turns it back on). Chart real estate goes
+// to the chart.
+//
+// v2.3 (2026-08-14) — removed the v2.2 timeframe hard-stop: it errored
+// the owner's chart on first load (RE10142). A wrong filter timeframe is
+// now VISIBLE (gate table + tint) instead of fatal.
+//
+// v2.2 (2026-08-14) — full review-panel fixes (19-agent panel, verified):
+//
+//   * YOUNG LISTINGS TELL THE TRUTH (SPCX): with too little history for
+//     the filter EMAs, the tint is GRAY ("no data"), not a confident red,
+//     and the payload says trend_filter:"insufficient_history". Longs
+//     stay blocked while unknown — same rule as the trading system.
+//   * The score columns can no longer glow green while the freefall veto
+//     blocks the trade: freefall paints its own color (maroon).
+//   * A small GATE TABLE (bottom-left) shows each long condition with a
+//     live pass/fail — the "why is there no triangle" answer at a glance.
+//   * Dropdown-path alerts (alertcondition) now carry score/wt1/momentum
+//     via plot placeholders — though "Any alert() function call" remains
+//     the correct setup.
+//
+// v2.1 (2026-08-14) — review fixes. WHAT CHANGED and WHY:
+//
+//   * TREND FILTER NO LONGER REPAINTS (the one real bug found in review).
+//     The old call read the DEVELOPING higher-timeframe bar live, but
+//     TradingView redraws history using only COMPLETED bars — so a signal
+//     could fire live that later looked impossible on the same chart, and
+//     backtests could not match live alerts. The filter now reads the last
+//     COMPLETED filter-timeframe bar, live and historical alike — which is
+//     also exactly what the trading system's Python mirror computes, so
+//     chart and bot now agree by construction. Honest cost: the filter
+//     reacts up to one filter-bar later.
+//   * Display only, no gate change: WT1 turns ORANGE inside the oversold
+//     zone, a small orange dot marks the day it ENTERS the zone ("watch"),
+//     and an aqua diamond marks a bullish divergence (price lower low,
+//     WT1 higher low out of the zone — the classic seller-exhaustion
+//     signature). None of these fire alerts or gate anything; the signal
+//     logic and the webhook JSON are byte-identical to v2.
+//   * Title dropped the "(1H)" — the script is timeframe-agnostic and the
+//     owner runs it on 1D.
+//
+//   AFTER PASTING: TradingView alerts keep running the OLD saved version.
+//   Delete the existing alert and re-create it (Any alert() function call).
+//
+// Three layers, all must agree for a long:
+//   1. WaveTrend (epsilon-guarded): cross UP out of the oversold zone
+//   2. FlowQ score TURNING UP (volume flow + path quality) while not still
+//      in freefall — sellers exhausting. NOTE: an earlier version demanded
+//      a strongly POSITIVE score here; that is self-contradictory at a
+//      bottom and fired 0 of 49 signals in simulation. The gate reads the
+//      TURN, not the level.
+//   3. Trend filter: EMA9 > EMA21 on the filter timeframe, COMPLETED bars
+//      only (Auto = two timeframes above the chart, see v2.5).
+//
+// Background tint shows the filter BOTH ways: green = uptrend, red = downtrend.
+// Exits (WaveTrend cross DOWN from overbought + selling confirmed) fire
+// regardless of the trend filter — you always get told to review a holding.
+//
+// Alert setup (once per chart):
+//   Condition: this indicator → "Any alert() function call"
+//   Expiration: Open-ended
+//   Webhook URL: https://YOUR_HOST/webhook?secret=YOUR_TV_BRIDGE_SECRET
+// =============================================================================
+
+//@version=6
+indicator("FlowQ MC v2", shorttitle="FLOWQ_MC2", overlay=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────
+wn1        = input.int(10,  "WaveTrend channel length")
+wn2        = input.int(21,  "WaveTrend average length")
+osZone     = input.int(-53, "Oversold zone")
+obZone     = input.int(53,  "Overbought zone")
+flowLen    = input.int(7,   "Flow smoothing (bars)")
+erLen      = input.int(24,  "Quality window (bars)")
+scoreSm    = input.int(3,   "Score smoothing")
+turnBars   = input.int(3,   "Flow-turn lookback (bars)", minval = 1, maxval = 20)
+extremeLvl = input.int(50,  "Freefall / melt-up veto level", minval = 20, maxval = 90)
+trendMode  = input.string("Auto", "Trend-filter timeframe",
+     options = ["Auto", "Manual"],
+     tooltip = "Auto = two timeframes above the chart (4h->W, D->M, W->3M, M->12M), falling back one step for young symbols.")
+trendTfMan = input.timeframe("W", "Manual trend-filter timeframe (must be above the chart)")
+tfFast     = input.int(9,   "Trend filter fast EMA")
+tfSlow     = input.int(21,  "Trend filter slow EMA")
+useTrend   = input.bool(true, "Require trend-filter uptrend for longs")
+// v2.4: OFF by default. The owner's chart drowned under three scripts'
+// overlays (2026-08-31, "shit overlap all over the place") — a diagnostic
+// table has to be something you summon, not furniture.
+showGates  = input.bool(false, "Show the long-gates table")
+// v2.5: the chart grades its own signals. Off by default for the same
+// reason as the gate table.
+showTrack  = input.bool(false, "Show the signal track record (self-backtest)")
+gradeBars  = input.int(10, "Track record: grade window (bars)", minval = 2, maxval = 100)
+gradeAtr   = input.float(1.5, "Track record: target = stop (x ATR)", minval = 0.25, step = 0.25)
+
+// v2.3: the v2.2 hard stop ("filter TF must be >= chart TF") is GONE — it
+// errored the owner's live chart on first load (RE10142, 2026-08-14). A
+// hard runtime.error was the wrong tool for a soft misconfiguration: with
+// the completed-bar idiom below, a filter TF at or below the chart TF
+// still returns sane last-completed values. The gate table shows the
+// filter state either way, so a strange setting is visible, not fatal.
+
+// ── WaveTrend core (epsilon-guarded) ────────────────────────────────
+esa = ta.ema(hlc3, wn1)
+dev = ta.ema(math.abs(hlc3 - esa), wn1)
+ci  = (hlc3 - esa) / (0.015 * math.max(dev, math.abs(hlc3) * 1e-6))
+wt1 = ta.ema(ci, wn2)
+wt2 = ta.sma(wt1, 4)
+
+// ── FlowQ score: volume flow + path quality (−100..+100) ────────────
+// v2.5: indices (SPX, NDX, DXY...) have na volume, which made the whole
+// score na — nothing ever fired. A symbol that has never printed volume
+// scores on path quality alone.
+volSeen   = ta.cum(nz(volume)) > 0
+signedVol = nz(math.sign(close - close[1])) * nz(volume)
+flowPct   = 100 * ta.ema(signedVol, flowLen) / math.max(ta.ema(nz(volume), flowLen), 1e-10)
+pathLen   = math.sum(math.abs(close - close[1]), erLen)
+erSigned  = pathLen > 0 ? 100 * (close - close[erLen]) / pathLen : 0.0
+score     = ta.ema(volSeen ? 0.5 * flowPct + 0.5 * erSigned : erSigned, scoreSm)
+
+// ── Trend filter: EMA9 > EMA21 on COMPLETED filter-TF bars ──────────
+// v2.1 repaint fix: expr[1] + lookahead_on is the standard non-repainting
+// idiom — it returns the LAST COMPLETED higher-timeframe bar's value on
+// live and historical bars alike. The old lookahead_off call showed the
+// developing bar live but only completed bars in history, so live signals
+// and the redrawn chart could disagree (and backtests lied).
+f_trendBull() =>
+    ta.ema(close, tfFast) > ta.ema(close, tfSlow)
+// v2.2: fetch the completed-bar count too — an EMA21 fed 5 bars returns a
+// confident-looking value that is really just noise around the seed. Below
+// tfSlow completed bars the filter is UNKNOWN: gray tint, longs blocked,
+// payload says so. (SPCX will sit in this state for its first months.)
+//
+// v2.5 AUTO timeframe: a filter on the chart's own timeframe contradicts
+// the oversold gate (0 daily longs in backtest), so Auto reads the trend
+// TWO timeframes up, and ONE up when the symbol is too young for that.
+chartSec = timeframe.in_seconds()
+autoTwo  = chartSec < timeframe.in_seconds("D") ? "W" :
+     chartSec < timeframe.in_seconds("W") ? "M" :
+     chartSec < timeframe.in_seconds("M") ? "3M" : "12M"
+autoOne  = chartSec < timeframe.in_seconds("D") ? "D" :
+     chartSec < timeframe.in_seconds("W") ? "W" :
+     chartSec < timeframe.in_seconds("M") ? "M" : "3M"
+useAuto  = trendMode == "Auto"
+tfMain   = useAuto ? autoTwo : trendTfMan
+[bullMain, barsMain] = request.security(syminfo.tickerid, tfMain,
+     [f_trendBull()[1], bar_index[1]], lookahead = barmerge.lookahead_on)
+[bullBack, barsBack] = request.security(syminfo.tickerid, autoOne,
+     [f_trendBull()[1], bar_index[1]], lookahead = barmerge.lookahead_on)
+knownMain  = not na(barsMain) and barsMain + 1 >= tfSlow
+knownBack  = useAuto and not na(barsBack) and barsBack + 1 >= tfSlow
+trendKnown = knownMain or knownBack
+trendBull  = knownMain ? bullMain : knownBack and bullBack
+trendTfUsed = knownMain or not knownBack ? tfMain : autoOne
+// Manual filter at or below the chart timeframe is shown, not fatal (v2.3).
+trendTfLow = not useAuto and timeframe.in_seconds(trendTfMan) <= chartSec
+
+// ── Signals ─────────────────────────────────────────────────────────
+// The FlowQ gate asks for a TURN, not a level. At a washout bottom recent
+// volume flow and path direction are NEGATIVE by construction, so demanding
+// a strongly positive score there is self-contradictory (it fired 0 of 49
+// oversold crosses in simulation — and 0 on a live 4-month HOOD chart).
+// What actually marks a bottom is sellers exhausting: the score TURNING UP
+// while not still in freefall. Mirrored for exits.
+fromOS = ta.lowest(wt1, 4)  <= osZone
+fromOB = ta.highest(wt1, 4) >= obZone
+scoreRising  = score > score[turnBars]
+scoreFalling = score < score[turnBars]
+notFreefall  = score > -extremeLvl       // not still cascading down
+notMeltUp    = score <  extremeLvl       // not a vertical blow-off
+confirmLong = ta.crossover(wt1, wt2) and fromOS and scoreRising and notFreefall and
+     (not useTrend or trendBull) and barstate.isconfirmed
+confirmExit = ta.crossunder(wt1, wt2) and fromOB and scoreFalling and notMeltUp and
+     barstate.isconfirmed
+
+// ── Display-only: zone visibility + bullish divergence (v2.1) ───────
+// The owner's eye finds the basing BEFORE the lime triangle confirms; the
+// chart now marks that early stage too. NOTHING here fires an alert or
+// gates a signal — promotion of any of these into the gate happens only
+// after the trading system's graded episodes prove it earns its place.
+enterOS = ta.crossunder(wt1, osZone)
+
+divLb = 2
+wtPl  = ta.pivotlow(wt1, divLb, divLb)   // confirmed divLb bars after the low
+var float prevWtPl = na
+var float prevPxPl = na
+var int   prevPlBar = na
+bool bullDiv = false
+if not na(wtPl)
+    pxAtPl = low[divLb]
+    if not na(prevWtPl) and not na(prevPlBar) and bar_index - prevPlBar <= 60 and
+         wtPl > prevWtPl and pxAtPl < prevPxPl and prevWtPl <= osZone
+        bullDiv := true
+    prevWtPl := wtPl
+    prevPxPl := pxAtPl
+    prevPlBar := bar_index
+
+// ── Plots (WaveTrend and score share the ±100 scale) ────────────────
+plot(0, "Zero", color = color.new(color.gray, 40))
+plot(obZone, "OB zone",  color = color.new(color.red, 40),   style = plot.style_circles)
+plot(osZone, "OS zone",  color = color.new(color.green, 40), style = plot.style_circles)
+// Score bars are coloured by DIRECTION (turning up / down) — that is what
+// the gate actually reads, so the chart matches the logic.
+// Freefall gets its OWN color: a rising score below -extremeLvl still
+// blocks the long, and green columns while the veto blocks was a display
+// lie (review panel, v2.2).
+plot(score, "FlowQ score", style = plot.style_columns,
+     color = score <= -extremeLvl ? color.new(color.maroon, 20) :
+     scoreRising ? color.new(color.green, 40) : color.new(color.red, 40))
+// WT1 turns orange while inside the oversold zone — the "watch" state.
+plot(wt1, "WT1", color = wt1 <= osZone ? color.orange : color.green)
+plot(wt2, "WT2", color = color.red, style = plot.style_circles)
+plotshape(confirmLong, "CONFIRMED long", style = shape.triangleup,
+     location = location.bottom, color = color.lime, size = size.normal)
+plotshape(confirmExit, "CONFIRMED exit", style = shape.triangledown,
+     location = location.top, color = color.red, size = size.normal)
+plotshape(enterOS, "Entered oversold zone (watch)", style = shape.circle,
+     location = location.bottom, color = color.new(color.orange, 20), size = size.tiny)
+plotshape(bullDiv, "Bullish divergence (display only)", style = shape.diamond,
+     location = location.bottom, color = color.new(color.aqua, 0), size = size.tiny,
+     offset = -divLb)
+// Trend filter painted BOTH ways: green = uptrend, red = downtrend.
+bgcolor(useTrend ? (not trendKnown ? color.new(color.gray, 88) :
+     trendBull ? color.new(color.green, 92) : color.new(color.red, 92)) : na,
+     title = "Trend filter state (gray = not enough history)")
+
+// ── Gate table: the "why is there no triangle" answer (v2.2) ───────
+var table gt = table.new(position.bottom_left, 2, 6, border_width = 1,
+     bgcolor = color.new(color.black, 20))
+f_gate(row, name, ok) =>
+    table.cell(gt, 0, row, name, text_color = color.new(color.silver, 0),
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(gt, 1, row, ok ? "PASS" : "no",
+         text_color = ok ? color.lime : color.new(color.red, 0),
+         text_size = size.small)
+if barstate.islast and showGates
+    table.cell(gt, 0, 0, "LONG GATES", text_color = color.silver,
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(gt, 1, 0, "", text_size = size.small)
+    f_gate(1, "zone touched (4 bars)", fromOS)
+    f_gate(2, "crossed up", wt1 > wt2)
+    f_gate(3, "score turning up", scoreRising)
+    f_gate(4, "not in freefall", notFreefall)
+    if useTrend
+        table.cell(gt, 0, 5, "trend filter (" + trendTfUsed +
+             (trendTfLow ? ", not above chart!" : "") + ")", text_color = color.silver,
+             text_size = size.small, text_halign = text.align_left)
+        table.cell(gt, 1, 5, not trendKnown ? "no data" : trendBull ? "PASS" : "no",
+             text_color = not trendKnown ? color.gray :
+             trendBull ? color.lime : color.new(color.red, 0),
+             text_size = size.small)
+
+// ── Signal track record: the chart grades its own triangles (v2.5) ──
+// Every confirmed triangle is entered at the NEXT bar's open and graded
+// over gradeBars bars: target and stop both gradeAtr x ATR(14) away. The
+// first one touched decides; a bar touching both counts as a loss; if
+// neither is touched, the close at the end of the window decides. EXIT
+// triangles are graded as shorts (did price fall?). "random" grades an
+// entry on EVERY bar the same way — the number a triangle has to beat.
+// This is the Python backtest's rule, so the table and the research
+// numbers in the header are comparable.
+type Trade
+    int   side         // +1 long, -1 exit (graded as a short)
+    bool  isBase       // random-entry baseline, not a signal
+    int   startBar     // the bar whose OPEN is the entry
+    float atrv
+    float entry = na
+    float up    = na
+    float dn    = na
+
+atr14 = ta.atr(14)
+var array<Trade> trades = array.new<Trade>()
+var int nL  = 0
+var int wL  = 0
+var int nX  = 0
+var int wX  = 0
+var int nBL = 0
+var int wBL = 0
+var int nBX = 0
+var int wBX = 0
+if showTrack
+    if array.size(trades) > 0
+        for i = array.size(trades) - 1 to 0
+            tr = array.get(trades, i)
+            if bar_index == tr.startBar
+                tr.entry := open
+                tr.up    := open + gradeAtr * tr.atrv
+                tr.dn    := open - gradeAtr * tr.atrv
+            if bar_index >= tr.startBar
+                int res = tr.side == 1 ? (low <= tr.dn ? 0 : high >= tr.up ? 1 : -1) :
+                     (high >= tr.up ? 0 : low <= tr.dn ? 1 : -1)
+                if res == -1 and bar_index - tr.startBar + 1 >= gradeBars
+                    res := (close - tr.entry) * tr.side > 0 ? 1 : 0
+                if res >= 0
+                    if tr.isBase
+                        if tr.side == 1
+                            nBL += 1
+                            wBL += res
+                        else
+                            nBX += 1
+                            wBX += res
+                    else
+                        if tr.side == 1
+                            nL += 1
+                            wL += res
+                        else
+                            nX += 1
+                            wX += res
+                    array.remove(trades, i)
+    if not na(atr14)
+        if confirmLong
+            array.push(trades, Trade.new(1, false, bar_index + 1, atr14))
+        if confirmExit
+            array.push(trades, Trade.new(-1, false, bar_index + 1, atr14))
+        if barstate.isconfirmed
+            array.push(trades, Trade.new(1, true, bar_index + 1, atr14))
+            array.push(trades, Trade.new(-1, true, bar_index + 1, atr14))
+
+var table tt = table.new(position.top_right, 5, 3, border_width = 1,
+     bgcolor = color.new(color.black, 20))
+f_rate(w, n) =>
+    n > 0 ? 100.0 * w / n : na
+f_trackRow(row, name, w, n, wb, nb) =>
+    r  = f_rate(w, n)
+    rb = f_rate(wb, nb)
+    e  = r - rb
+    // Under 30 graded signals the win-rate is mostly luck: gray, with "*".
+    small = n < 30
+    table.cell(tt, 0, row, name, text_color = color.silver, text_size = size.small,
+         text_halign = text.align_left)
+    table.cell(tt, 1, row, str.tostring(n) + (small ? "*" : ""),
+         text_color = color.silver, text_size = size.small)
+    table.cell(tt, 2, row, na(r) ? "-" : str.tostring(r, "#") + "%",
+         text_color = color.silver, text_size = size.small)
+    table.cell(tt, 3, row, na(rb) ? "-" : str.tostring(rb, "#") + "%",
+         text_color = color.gray, text_size = size.small)
+    table.cell(tt, 4, row, na(e) ? "-" : (e >= 0 ? "+" : "") + str.tostring(e, "#.#"),
+         text_color = na(e) or small ? color.gray : e >= 3 ? color.lime :
+         e <= -3 ? color.new(color.red, 0) : color.silver, text_size = size.small)
+if barstate.islast and showTrack
+    table.cell(tt, 0, 0, str.tostring(gradeBars) + " bars, " + str.tostring(gradeAtr) + " ATR",
+         text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(tt, 1, 0, "n", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 2, 0, "win", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 3, 0, "random", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 4, 0, "edge", text_color = color.gray, text_size = size.small)
+    f_trackRow(1, "LONG", wL, nL, wBL, nBL)
+    f_trackRow(2, "EXIT", wX, nX, wBX, nBX)
+
+// ── Webhook JSON (fields match tv_webhook_bridge.normalize_signal) ──
+rsiVal = ta.rsi(close, 14)
+plot(rsiVal, "RSI", display = display.none)   // feeds dropdown placeholders
+f_json(evt, trendStr) =>
+    '{"ticker":"' + syminfo.ticker +
+     '","price":' + str.tostring(close, format.mintick) +
+     ',"trend":"' + trendStr +
+     '","momentum":' + str.tostring(rsiVal, "#.##") +
+     ',"timeframe":"' + timeframe.period +
+     '","bar_time":' + str.tostring(time) +
+     ',"strategy":"flowq_mc_v2","event":"' + evt +
+     '","score":' + str.tostring(score, "#.##") +
+     ',"score_turning":"' + (scoreRising ? "up" : "down") +
+     '","wt1":' + str.tostring(wt1, "#.##") +
+     ',"trend_filter":"' + (not trendKnown ? "insufficient_history" :
+     trendBull ? "bullish" : "bearish") + '"}'
+
+if confirmLong
+    alert(f_json("confirmed_long", "bullish"), alert.freq_once_per_bar_close)
+if confirmExit
+    alert(f_json("confirmed_exit", "bearish"), alert.freq_once_per_bar_close)
+
+// Named conditions for the alert-dialog dropdown (static placeholder JSON)
+alertcondition(confirmLong, "FlowQ v2 CONFIRMED long",
+     '{"ticker":"{{ticker}}","price":{{close}},"trend":"bullish","momentum":{{plot("RSI")}},"timeframe":"{{interval}}","bar_time":{{timenow}},"strategy":"flowq_mc_v2","event":"confirmed_long","score":{{plot("FlowQ score")}},"wt1":{{plot("WT1")}}}')
+alertcondition(confirmExit, "FlowQ v2 CONFIRMED exit",
+     '{"ticker":"{{ticker}}","price":{{close}},"trend":"bearish","momentum":{{plot("RSI")}},"timeframe":"{{interval}}","bar_time":{{timenow}},"strategy":"flowq_mc_v2","event":"confirmed_exit","score":{{plot("FlowQ score")}},"wt1":{{plot("WT1")}}}')
