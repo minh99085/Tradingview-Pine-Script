@@ -1,0 +1,374 @@
+// =============================================================================
+// FlowQ MC v2.6 — same signal as v2.5, operable on a chart
+// =============================================================================
+// v2.6 does not claim a bigger edge. The v2.5 header already measured this
+// family at out-of-sample AUC 0.51-0.53. A second pass on TSLA daily bars
+// (repaired 1D file, 4044 sessions, 2010-06-29 to 2026-07-29, Python EMA with
+// an SMA seed — close to Pine, not a TradingView certificate) agreed:
+//
+//   * The v2.5 long fired 26 times.
+//   * Read one-at-a-time and held to the overbought exit (fill next open):
+//     14 closed trades, about +22% average, +8% median, 64% wins, ~85 days.
+//     None were still open at the end of the file.
+//   * A 1.5 ATR stop on those same entries: about +5% average, -7% median.
+//   * A close through the signal-bar low: about +7% average, -3% median.
+//   * The script's own 10-bar / +/-1.5 ATR grade: 38.5% wins, against 53.7%
+//     for a long taken on every bar. That grade is a different test than the
+//     exit the alert sends. v2.5's track record only showed the harsh test.
+//
+// So v2.6 does not retune WaveTrend, the score, the zone, or the Auto
+// trend filter. Those stays byte-for-byte the v2.5 gates. What changed:
+//
+//   * The gate table is on, and each row is a gate the long actually uses.
+//     "Crossed up" is no longer "wt1 happens to be above wt2". The old row
+//     could read PASS on a bar that can never print a triangle.
+//   * Every gate is also in the data window, so a past bar can be audited.
+//   * A one-at-a-time book (next-open fill, held until the overbought exit)
+//     is tallied on the chart you are looking at. This is the trade the
+//     exit alert corresponds to. It is this chart's past, not a forecast.
+//   * "One position at a time" is an input, default OFF, so existing alerts
+//     stay the v2.5 stream. Turn it on to suppress a second long while the
+//     book is still open. Leaving it off does not change a single alert.
+//   * Webhook numbers use null when a value is missing. str.tostring(na)
+//     is the token NaN, which is not JSON.
+//   * The trend filter still reads the last COMPLETED higher-timeframe bar
+//     (the [1] is inside the requested expression). Same rule as v2.5.
+//
+// Webhook fields v2.5 already sent are unchanged, including
+// strategy "flowq_mc_v2". New fields are extras. Re-create the alert
+// (Any alert() function call) after pasting. Then Reset settings on the
+// inputs — TradingView keeps old per-chart values.
+// =============================================================================
+
+//@version=6
+indicator("FlowQ MC v2.6", shorttitle = "FLOWQ_MC26", overlay = false)
+
+// --- Inputs (same gates as v2.5) ------------------------------------------
+wn1        = input.int(10,  "WaveTrend channel length")
+wn2        = input.int(21,  "WaveTrend average length")
+osZone     = input.int(-53, "Oversold zone")
+obZone     = input.int(53,  "Overbought zone")
+flowLen    = input.int(7,   "Flow smoothing (bars)")
+erLen      = input.int(24,  "Quality window (bars)")
+scoreSm    = input.int(3,   "Score smoothing")
+turnBars   = input.int(3,   "Flow-turn lookback (bars)", minval = 1, maxval = 20)
+extremeLvl = input.int(50,  "Freefall / melt-up veto level", minval = 20, maxval = 90)
+trendMode  = input.string("Auto", "Trend-filter timeframe",
+     options = ["Auto", "Manual"],
+     tooltip = "Auto = two timeframes above the chart (4h->W, D->M, W->3M, M->12M), falling back one step when the symbol is too young for that.")
+trendTfMan = input.timeframe("W", "Manual trend-filter timeframe")
+tfFast     = input.int(9,   "Trend filter fast EMA")
+tfSlow     = input.int(21,  "Trend filter slow EMA")
+useTrend   = input.bool(true, "Require trend-filter uptrend for longs")
+oneAtATime = input.bool(false, "One position at a time",
+     tooltip = "Off = identical long alerts to v2.5, including a second long while a prior one has not had an overbought exit. On = suppress that second long. The book table always shows the one-at-a-time reading either way. On TSLA daily the one-at-a-time book was the better reading of these signals; a tight stop was not. Default stays off so a live alert does not change under you.")
+showGates  = input.bool(true, "Show the long-gates table")
+showTrack  = input.bool(false, "Show the 10-bar barrier grade (not the real exit)")
+gradeBars  = input.int(10, "Barrier grade window (bars)", minval = 2, maxval = 100)
+gradeAtr   = input.float(1.5, "Barrier grade distance (x ATR)", minval = 0.25, step = 0.25)
+
+// --- WaveTrend (v2.5 formula) ---------------------------------------------
+esa = ta.ema(hlc3, wn1)
+dev = ta.ema(math.abs(hlc3 - esa), wn1)
+ci  = (hlc3 - esa) / (0.015 * math.max(dev, math.abs(hlc3) * 1e-6))
+wt1 = ta.ema(ci, wn2)
+wt2 = ta.sma(wt1, 4)
+
+// --- FlowQ score (v2.5 formula, including the no-volume fallback) --------
+volSeen   = ta.cum(nz(volume)) > 0
+signedVol = nz(math.sign(close - close[1])) * nz(volume)
+flowPct   = 100 * ta.ema(signedVol, flowLen) / math.max(ta.ema(nz(volume), flowLen), 1e-10)
+pathLen   = math.sum(math.abs(close - close[1]), erLen)
+erSigned  = pathLen > 0 ? 100 * (close - close[erLen]) / pathLen : 0.0
+score     = ta.ema(volSeen ? 0.5 * flowPct + 0.5 * erSigned : erSigned, scoreSm)
+
+// --- Trend filter: last COMPLETED filter bar, live and in history --------
+// [1] lives inside the expression request.security evaluates on the filter
+// timeframe. lookahead_on without that offset would paint the forming bar.
+f_trendPack() =>
+    [ta.ema(close, tfFast)[1], ta.ema(close, tfSlow)[1], bar_index[1]]
+
+chartSec = timeframe.in_seconds()
+autoTwo  = chartSec < timeframe.in_seconds("D") ? "W" :
+     chartSec < timeframe.in_seconds("W") ? "M" :
+     chartSec < timeframe.in_seconds("M") ? "3M" : "12M"
+autoOne  = chartSec < timeframe.in_seconds("D") ? "D" :
+     chartSec < timeframe.in_seconds("W") ? "W" :
+     chartSec < timeframe.in_seconds("M") ? "M" : "3M"
+useAuto  = trendMode == "Auto"
+tfMain   = useAuto ? autoTwo : trendTfMan
+[fastMain, slowMain, barsMain] = request.security(syminfo.tickerid, tfMain, f_trendPack(), lookahead = barmerge.lookahead_on)
+[fastBack, slowBack, barsBack] = request.security(syminfo.tickerid, autoOne, f_trendPack(), lookahead = barmerge.lookahead_on)
+bullMain   = not na(fastMain) and not na(slowMain) and fastMain > slowMain
+bullBack   = not na(fastBack) and not na(slowBack) and fastBack > slowBack
+knownMain  = not na(barsMain) and barsMain + 1 >= tfSlow and not na(fastMain) and not na(slowMain)
+knownBack  = useAuto and not na(barsBack) and barsBack + 1 >= tfSlow and not na(fastBack) and not na(slowBack)
+trendKnown = knownMain or knownBack
+trendBull  = knownMain ? bullMain : knownBack and bullBack
+trendTfUsed = knownMain or not knownBack ? tfMain : autoOne
+trendTfLow = not useAuto and timeframe.in_seconds(trendTfMan) <= chartSec
+
+// --- v2.5 signal, unchanged -----------------------------------------------
+OS_LOOK = 4
+fromOS = ta.lowest(wt1, OS_LOOK) <= osZone
+fromOB = ta.highest(wt1, OS_LOOK) >= obZone
+scoreRising  = score > score[turnBars]
+scoreFalling = score < score[turnBars]
+notFreefall  = score > -extremeLvl
+notMeltUp    = score <  extremeLvl
+crossUp = ta.crossover(wt1, wt2)
+crossDn = ta.crossunder(wt1, wt2)
+setupLong = crossUp and fromOS and scoreRising and notFreefall and (not useTrend or trendBull) and barstate.isconfirmed
+setupExit = crossDn and fromOB and scoreFalling and notMeltUp and barstate.isconfirmed
+
+// --- One-at-a-time book (display). Alerts ignore it unless the input is on.
+var bool  simOpen   = false
+var bool  pendEntry = false
+var bool  pendExit  = false
+var float simPx     = na
+var float sigClose  = na
+var float sigLow    = na
+var int   sigBar    = na
+var int   bookN     = 0
+var int   bookW     = 0
+var float bookSum   = 0.0
+
+// Decision uses the state the bar OPENED with. Fills below update it after.
+flatBook = not simOpen and not pendEntry
+confirmLong = setupLong and (not oneAtATime or flatBook)
+confirmExit = setupExit
+
+if barstate.isconfirmed
+    if pendEntry and not na(open)
+        simPx := open
+        simOpen := true
+        pendEntry := false
+    else if pendExit and simOpen and not na(open) and not na(simPx) and simPx > 0
+        float ret = open / simPx - 1.0
+        bookN += 1
+        bookSum += ret
+        if ret > 0
+            bookW += 1
+        simOpen := false
+        simPx := na
+        pendExit := false
+        sigClose := na
+        sigLow := na
+        sigBar := na
+    if simOpen and setupExit
+        pendExit := true
+    else if not simOpen and not pendEntry and setupLong and not setupExit
+        pendEntry := true
+        sigClose := close
+        sigLow := low
+        sigBar := bar_index
+
+inBook = simOpen or pendEntry
+barsHeld = inBook and not na(sigBar) ? bar_index - sigBar : 0
+
+reason = not barstate.isconfirmed ? "bar still forming - nothing fires until the close" :
+     confirmLong ? "LONG" :
+     not fromOS ? "no oversold touch in last 4 bars" :
+     not crossUp ? "no WaveTrend cross on this bar" :
+     not scoreRising ? "score is not higher than the lookback" :
+     not notFreefall ? "score still in freefall" :
+     useTrend and not trendKnown ? "trend filter has too little history" :
+     useTrend and not trendBull ? "trend filter is down" :
+     oneAtATime and not flatBook ? "book still open - second long suppressed" :
+     "gates open, waiting for the bar to close"
+
+// --- Plots ----------------------------------------------------------------
+plot(0, "Zero", color = color.new(color.gray, 40))
+plot(obZone, "OB zone", color = color.new(color.red, 40), style = plot.style_circles)
+plot(osZone, "OS zone", color = color.new(color.green, 40), style = plot.style_circles)
+plot(score, "FlowQ score", style = plot.style_columns,
+     color = score <= -extremeLvl ? color.new(color.maroon, 20) :
+     scoreRising ? color.new(color.green, 40) : color.new(color.red, 40))
+plot(wt1, "WT1", color = wt1 <= osZone ? color.orange : color.green)
+plot(wt2, "WT2", color = color.red, style = plot.style_circles)
+plotshape(confirmLong, "CONFIRMED long", style = shape.triangleup,
+     location = location.bottom, color = color.lime, size = size.normal)
+plotshape(confirmExit, "CONFIRMED exit", style = shape.triangledown,
+     location = location.top, color = color.red, size = size.normal)
+plotshape(setupLong and not confirmLong, "Long suppressed (book still open)",
+     style = shape.xcross, location = location.bottom, color = color.new(color.gray, 0), size = size.tiny)
+plotshape(ta.crossunder(wt1, osZone), "Entered oversold zone (watch)",
+     style = shape.circle, location = location.bottom, color = color.new(color.orange, 20), size = size.tiny)
+
+// Same display-only divergence as v2.5. It does not gate and does not alert.
+divLb = 2
+wtPl = ta.pivotlow(wt1, divLb, divLb)
+var float prevWtPl = na
+var float prevPxPl = na
+var int   prevPlBar = na
+bool bullDiv = false
+if not na(wtPl)
+    pxAtPl = low[divLb]
+    if not na(prevWtPl) and not na(prevPlBar) and bar_index - prevPlBar <= 60 and wtPl > prevWtPl and pxAtPl < prevPxPl and prevWtPl <= osZone
+        bullDiv := true
+    prevWtPl := wtPl
+    prevPxPl := pxAtPl
+    prevPlBar := bar_index
+plotshape(bullDiv, "Bullish divergence (display only)", style = shape.diamond,
+     location = location.bottom, color = color.new(color.aqua, 0), size = size.tiny, offset = -divLb)
+
+bgcolor(useTrend ? (not trendKnown ? color.new(color.gray, 82) : trendBull ? color.new(color.green, 88) : color.new(color.red, 88)) : na,
+     title = "Trend filter (gray = not enough history)")
+
+// Data window: scroll back to any bar and read the gates. 1 = true.
+plot(fromOS ? 1 : 0, "Gate: oversold touch", display = display.data_window)
+plot(crossUp ? 1 : 0, "Gate: cross this bar", display = display.data_window)
+plot(scoreRising ? 1 : 0, "Gate: score turning up", display = display.data_window)
+plot(notFreefall ? 1 : 0, "Gate: not freefall", display = display.data_window)
+plot(not useTrend ? 1 : not trendKnown ? -1 : trendBull ? 1 : 0, "Gate: trend (1 pass, 0 fail, -1 no data)", display = display.data_window)
+plot(inBook ? 1 : 0, "Book open", display = display.data_window)
+plot(inBook ? sigClose : na, "Book signal close", display = display.status_line + display.data_window)
+plot(inBook ? sigLow : na, "Book signal-bar low", display = display.status_line + display.data_window)
+
+// --- Gate table ------------------------------------------------------------
+var table gt = table.new(position.bottom_left, 2, 9, border_width = 1, bgcolor = color.new(color.black, 15))
+f_cell(col, row, txt, colr) =>
+    table.cell(gt, col, row, txt, text_color = colr, text_size = size.small, text_halign = text.align_left)
+f_gate(row, name, ok) =>
+    f_cell(0, row, name, color.silver)
+    f_cell(1, row, ok ? "PASS" : "no", ok ? color.lime : color.red)
+if barstate.islast and not showGates
+    for row = 0 to 8
+        table.cell(gt, 0, row, "")
+        table.cell(gt, 1, row, "")
+if barstate.islast and showGates
+    f_cell(0, 0, "WHY", color.silver)
+    f_cell(1, 0, reason, confirmLong ? color.lime : color.white)
+    f_gate(1, "oversold touch (4 bars)", fromOS)
+    f_gate(2, "WaveTrend cross THIS bar", crossUp)
+    f_gate(3, "score higher than lookback", scoreRising)
+    f_gate(4, "score above freefall", notFreefall)
+    trendTxt = not useTrend ? "off" : not trendKnown ? "no data" : trendBull ? "PASS" : "no"
+    trendCol = not useTrend ? color.gray : not trendKnown ? color.gray : trendBull ? color.lime : color.red
+    f_cell(0, 5, "trend filter (" + trendTfUsed + (trendTfLow ? ", not above chart" : "") + ")", color.silver)
+    f_cell(1, 5, trendTxt, trendCol)
+    bookState = not inBook ? "flat" : (simOpen ? "open " : "fill next open, signal ") + str.tostring(barsHeld) + " bars"
+    f_cell(0, 6, "one-at-a-time book", color.silver)
+    f_cell(1, 6, bookState, inBook ? color.yellow : color.gray)
+    avgPct = bookN > 0 ? 100.0 * bookSum / bookN : na
+    winPct = bookN > 0 ? 100.0 * bookW / bookN : na
+    bookTxt = bookN == 0 ? "no closed trade yet" : str.tostring(bookN) + " trades, win " + str.tostring(winPct, "#") + "%, avg " + str.tostring(avgPct, "#.#") + "%"
+    f_cell(0, 7, "held to the exit alert", color.silver)
+    f_cell(1, 7, bookTxt, color.silver)
+    f_cell(0, 8, "this chart only", color.gray)
+    f_cell(1, 8, oneAtATime ? "second longs are suppressed" : "alerts still fire if the book is open", color.gray)
+
+// --- 10-bar barrier grade (v2.5's test). Off by default. ------------------
+// This is NOT the trade above. A 10-bar +/- ATR barrier answers a different
+// question, and on TSLA daily it looked worse than buying every bar.
+type Trade
+    int   side
+    bool  isBase
+    int   startBar
+    float atrv
+    float entry = na
+    float up    = na
+    float dn    = na
+
+atr14 = ta.atr(14)
+var array<Trade> trades = array.new<Trade>()
+var int nL = 0
+var int wL = 0
+var int nX = 0
+var int wX = 0
+var int nBL = 0
+var int wBL = 0
+var int nBX = 0
+var int wBX = 0
+if showTrack and barstate.isconfirmed
+    if array.size(trades) > 0
+        for i = array.size(trades) - 1 to 0
+            tr = array.get(trades, i)
+            if bar_index == tr.startBar and not na(open)
+                tr.entry := open
+                tr.up := open + gradeAtr * tr.atrv
+                tr.dn := open - gradeAtr * tr.atrv
+            if bar_index >= tr.startBar and not na(tr.entry)
+                int res = tr.side == 1 ? (low <= tr.dn ? 0 : high >= tr.up ? 1 : -1) : (high >= tr.up ? 0 : low <= tr.dn ? 1 : -1)
+                if res == -1 and bar_index - tr.startBar + 1 >= gradeBars
+                    res := (close - tr.entry) * tr.side > 0 ? 1 : 0
+                if res >= 0
+                    if tr.isBase
+                        if tr.side == 1
+                            nBL += 1
+                            wBL += res
+                        else
+                            nBX += 1
+                            wBX += res
+                    else
+                        if tr.side == 1
+                            nL += 1
+                            wL += res
+                        else
+                            nX += 1
+                            wX += res
+                    array.remove(trades, i)
+    if not na(atr14)
+        if confirmLong
+            array.push(trades, Trade.new(1, false, bar_index + 1, atr14))
+        if confirmExit
+            array.push(trades, Trade.new(-1, false, bar_index + 1, atr14))
+        array.push(trades, Trade.new(1, true, bar_index + 1, atr14))
+        array.push(trades, Trade.new(-1, true, bar_index + 1, atr14))
+
+var table tt = table.new(position.top_right, 5, 3, border_width = 1, bgcolor = color.new(color.black, 15))
+f_rate(w, n) =>
+    n > 0 ? 100.0 * w / n : na
+f_trackRow(row, name, w, n, wb, nb) =>
+    r = f_rate(w, n)
+    rb = f_rate(wb, nb)
+    e = r - rb
+    small = n < 30
+    table.cell(tt, 0, row, name, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(tt, 1, row, str.tostring(n) + (small ? "*" : ""), text_color = color.silver, text_size = size.small)
+    table.cell(tt, 2, row, na(r) ? "-" : str.tostring(r, "#") + "%", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 3, row, na(rb) ? "-" : str.tostring(rb, "#") + "%", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 4, row, na(e) ? "-" : (e >= 0 ? "+" : "") + str.tostring(e, "#.#"),
+         text_color = na(e) or small ? color.gray : e >= 3 ? color.lime : e <= -3 ? color.red : color.silver, text_size = size.small)
+if barstate.islast and not showTrack
+    for row = 0 to 2
+        for col = 0 to 4
+            table.cell(tt, col, row, "")
+if barstate.islast and showTrack
+    table.cell(tt, 0, 0, "10-bar barrier, not the exit", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(tt, 1, 0, "n", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 2, 0, "win", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 3, 0, "random", text_color = color.gray, text_size = size.small)
+    table.cell(tt, 4, 0, "edge", text_color = color.gray, text_size = size.small)
+    f_trackRow(1, "LONG", wL, nL, wBL, nBL)
+    f_trackRow(2, "EXIT", wX, nX, wBX, nBX)
+
+// --- Webhook ---------------------------------------------------------------
+rsiVal = ta.rsi(close, 14)
+plot(rsiVal, "RSI", display = display.none)
+f_num(x, fmt) =>
+    na(x) ? "null" : str.tostring(x, fmt)
+f_json(evt, trendStr) =>
+    '{"ticker":"' + syminfo.ticker +
+     '","price":' + f_num(close, format.mintick) +
+     ',"trend":"' + trendStr +
+     '","momentum":' + f_num(rsiVal, "#.##") +
+     ',"timeframe":"' + timeframe.period +
+     '","bar_time":' + str.tostring(time) +
+     ',"strategy":"flowq_mc_v2","event":"' + evt +
+     '","score":' + f_num(score, "#.##") +
+     ',"score_turning":"' + (scoreRising ? "up" : "down") +
+     '","wt1":' + f_num(wt1, "#.##") +
+     ',"trend_filter":"' + (not trendKnown ? "insufficient_history" : trendBull ? "bullish" : "bearish") +
+     '","script_version":"2.6","book_open":' + (inBook ? "true" : "false") +
+     ',"bars_held":' + str.tostring(barsHeld) + '}'
+
+if confirmLong
+    alert(f_json("confirmed_long", "bullish"), alert.freq_once_per_bar_close)
+if confirmExit
+    alert(f_json("confirmed_exit", "bearish"), alert.freq_once_per_bar_close)
+
+alertcondition(confirmLong, "FlowQ v2.6 CONFIRMED long",
+     '{"ticker":"{{ticker}}","price":{{close}},"trend":"bullish","momentum":{{plot("RSI")}},"timeframe":"{{interval}}","bar_time":{{timenow}},"strategy":"flowq_mc_v2","event":"confirmed_long","score":{{plot("FlowQ score")}},"wt1":{{plot("WT1")}}}')
+alertcondition(confirmExit, "FlowQ v2.6 CONFIRMED exit",
+     '{"ticker":"{{ticker}}","price":{{close}},"trend":"bearish","momentum":{{plot("RSI")}},"timeframe":"{{interval}}","bar_time":{{timenow}},"strategy":"flowq_mc_v2","event":"confirmed_exit","score":{{plot("FlowQ score")}},"wt1":{{plot("WT1")}}}')
